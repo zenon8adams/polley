@@ -15,17 +15,18 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <curl/curl.h>
+#include <algorithm>
 
 namespace fs = std::filesystem;
 
-#ifndef MAX_IO_SIZE
 #define MAX_IO_SIZE_DEFAULT (8 * 1024 * 1024)
 #if defined(SSIZE_MAX) && (SSIZE_MAX < MAX_IO_SIZE_DEFAULT)
 #define MAX_IO_SIZE SSIZE_MAX
 #else
 #define MAX_IO_SIZE MAX_IO_SIZE_DEFAULT
 #endif
-#endif
+
+#define BUFFER_SIZE 4096
 
 #define GIT_SHA256_RAWSZ 32
 #define GIT_MAX_RAWSZ GIT_SHA256_RAWSZ
@@ -105,8 +106,9 @@ struct object_entry {
 		struct {
 			struct object_id obj_tree;
 			struct object_id obj_parent;
-		};	       // For commit types.
-		char *content; // for blob types.
+		};			      // For commit types.
+		struct object_id base_object; // For ref delta types
+		char *content;		      // for blob types.
 	};
 };
 
@@ -134,14 +136,15 @@ struct pack_header {
 };
 
 unsigned long big_file_threshold = 512 * 1024 * 1024;
-static unsigned char input_buffer[4096];
+static unsigned char input_buffer[BUFFER_SIZE];
 static unsigned int input_offset, input_len;
 static off_t consumed_bytes;
 static off_t max_input_size;
-static unsigned deepest_delta;
 static uint32_t input_crc32;
 static int input_fd, output_fd;
 static int nr_objects;
+
+static unsigned char fan_out[4 * 256];
 
 static void *fill(unsigned int min);
 static void flush(void);
@@ -183,6 +186,11 @@ void die_errno(const char *fmt, ...);
 static const char *fmt_with_err(char *buf, int n, const char *fmt);
 static void bad_object(off_t offset, const char *format, ...);
 void write_or_die(int fd, const void *buf, size_t count);
+
+int hash_cmp(const struct object_id *one, const struct object_id *other);
+int selective_hash_cmp(const void *one, const void *other);
+
+void print_hash(const unsigned char *hash, bool nl = true);
 
 void sha_init(SHA_CTX *ctx) {
 	DISABLE_DEPRECATED_WARNINGS_BEGIN;
@@ -379,9 +387,8 @@ static void parse_pack_header(void) {
 }
 
 static std::unique_ptr<struct object_entry[]> parse_pack_objects() {
-	int i;
 	auto objects = std::make_unique<struct object_entry[]>(nr_objects);
-	for (i = 0; i < nr_objects; i++) {
+	for (int i = 0; i < nr_objects; i++) {
 		auto obj  = &objects[i];
 		auto data = unpack_raw_entry(obj);
 		printf("IDX: %d, TYPE: %s HASH: ", i,
@@ -418,7 +425,6 @@ static std::unique_ptr<struct object_entry[]> parse_pack_objects() {
 		}
 
 		if (obj->type == OBJ_OFS_DELTA || obj->type == OBJ_REF_DELTA) {
-			;
 		} else if (!data) {
 			die("Error occurred while processing request");
 		} else if (obj->type == OBJ_BLOB) {
@@ -431,20 +437,26 @@ static std::unique_ptr<struct object_entry[]> parse_pack_objects() {
 				make_hash(p, reinterpret_cast<char *>(
 						     obj->obj_tree.hash));
 			}
-
-			const char *parent = "parent ";
-			if ((p = static_cast<char *>(
-				     memmem(static_cast<const void *>(buf),
-					    GIT_SHA1_HEXSZ * 4, // Don't search
-								// more than
-								// this
-					    static_cast<const void *>(parent),
-					    strlen(parent))))) {
-				p += strlen(parent);
-				make_hash(p, reinterpret_cast<char *>(
-						     obj->obj_parent.hash));
-			}
 		}
+	}
+
+	auto objs = objects.get();
+	qsort(objs, nr_objects, sizeof(*objs), selective_hash_cmp);
+
+	for (int i = 0; i < nr_objects; ++i) {
+		auto *hash = objs[i].type == OBJ_REF_DELTA ?
+				     objs[i].base_object.hash :
+				     objs[i].idx.oid.hash;
+		print_hash(hash, false);
+		printf(" type: %s\n", object_type_to_str(objs[i].type));
+		unsigned char key = *hash;
+		*reinterpret_cast<uint32_t *>(fan_out + key * 4) += 1;
+	}
+
+	// Do prefix sum of all initial hashes
+	for (size_t i = 1 * 4; i < sizeof(fan_out); i += 4) {
+		*reinterpret_cast<uint32_t *>(fan_out + i) +=
+			*reinterpret_cast<uint32_t *>(fan_out + i - 4);
 	}
 
 	return objects;
@@ -456,7 +468,6 @@ unpack_raw_entry(struct object_entry *obj) {
 	unsigned long size, c;
 	unsigned shift;
 	off_t base_offset;
-	struct object_id base_object;
 
 	obj->idx.offset = consumed_bytes;
 	printf("\nOffset: %zu, current crc32: %u, input_offset: %d\n",
@@ -481,15 +492,9 @@ unpack_raw_entry(struct object_entry *obj) {
 
 	switch (obj->type) {
 		case OBJ_REF_DELTA:
-			memcpy(base_object.hash, fill(GIT_SHA1_RAWSZ),
+			memcpy(&obj->base_object.hash, fill(GIT_SHA1_RAWSZ),
 			       GIT_SHA1_RAWSZ);
 			use(GIT_SHA1_RAWSZ);
-			printf("This %s references: ",
-			       object_type_to_str(obj->type));
-			for (int i = 0; i < GIT_SHA1_RAWSZ; ++i) {
-				printf("%02x", base_object.hash[i]);
-			}
-			putchar('\n');
 			break;
 		case OBJ_OFS_DELTA:
 			p = static_cast<unsigned char *>(fill(1));
@@ -678,7 +683,8 @@ int git_inflate(git_zstream *strm, int flush) {
 
 	for (;;) {
 		zlib_pre_call(strm);
-		/* Never say Z_FINISH unless we are feeding everything */
+		/* Never say Z_FINISH unless we are feeding everything
+		 */
 		status = inflate(&strm->z,
 				 (strm->z.avail_in != strm->avail_in) ? 0 :
 									flush);
@@ -697,7 +703,8 @@ int git_inflate(git_zstream *strm, int flush) {
 	}
 
 	switch (status) {
-		/* Z_BUF_ERROR: normal, needs more space in the output buffer */
+		/* Z_BUF_ERROR: normal, needs more space in the output
+		 * buffer */
 		case Z_BUF_ERROR:
 		case Z_OK:
 		case Z_STREAM_END:
@@ -713,7 +720,7 @@ int git_inflate(git_zstream *strm, int flush) {
 static const char *zerr_to_string(int status) {
 	switch (status) {
 		case Z_MEM_ERROR:
-			return "out of memory";
+			return "o; of memory";
 		case Z_VERSION_ERROR:
 			return "wrong version";
 		case Z_NEED_DICT:
@@ -805,7 +812,8 @@ static const char *fmt_with_err(char *buf, int n, const char *fmt) {
 		if (j < sizeof(str_error) - 1) {
 			str_error[j++] = '%';
 		} else {
-			/* No room to double the '%', so we overwrite it with
+			/* No room to double the '%', so we overwrite it
+			 * with
 			 * '\0' below */
 			j--;
 			break;
@@ -871,24 +879,60 @@ std::string strm_pkt_line(Stream &&strm, bool *eof, bool should_skip = false) {
 	return {};
 }
 
-int hash_cmp(const void *one, const void *other) {
-	return memcmp(
-		static_cast<const struct object_entry *>(one)->idx.oid.hash,
-		static_cast<const struct object_entry *>(other)->idx.oid.hash,
-		GIT_SHA1_RAWSZ);
+bool hash_eq(const object_entry &one, const object_entry &other) {
+	return !memcmp(one.idx.oid.hash, other.idx.oid.hash, GIT_SHA1_RAWSZ);
 }
 
-int obj_entry_hash_cmp(const void *key, const void *other) {
-	return memcmp(
-		static_cast<const struct object_id *>(key)->hash,
-		static_cast<const struct object_entry *>(other)->idx.oid.hash,
-		GIT_SHA1_RAWSZ);
+bool type_eq(const object_entry &one, const object_entry &other) {
+	return one.type == other.type;
+}
+
+int selective_hash_cmp(const void *one, const void *other) {
+	auto *real_one	 = static_cast<const object_entry *>(one);
+	auto *real_other = static_cast<const object_entry *>(other);
+	auto *one_hash	 = real_one->type == OBJ_REF_DELTA ?
+				   real_one->base_object.hash :
+				   real_one->idx.oid.hash;
+	auto *other_hash = real_other->type == OBJ_REF_DELTA ?
+				   real_other->base_object.hash :
+				   real_other->idx.oid.hash;
+
+	return memcmp(one_hash, other_hash, GIT_SHA1_RAWSZ);
+}
+
+int hash_cmp(const struct object_id *one, const struct object_id *other) {
+	return memcmp(one->hash, other->hash, GIT_SHA1_RAWSZ);
+}
+
+void print_hash(const unsigned char *hash, bool nl) {
+	for (int j = 0; j < GIT_SHA1_RAWSZ; ++j) {
+		printf("%02x", hash[j]);
+	}
+	if (nl) {
+		putchar('\n');
+	}
 }
 
 struct object_entry *find_object(struct object_entry *objects,
 				 struct object_id oid) {
-	return static_cast<struct object_entry *>(
-		bsearch(&oid, objects, nr_objects, sizeof(*objects), hash_cmp));
+	unsigned char key = *(oid.hash);
+	int high	  = *reinterpret_cast<uint32_t *>(fan_out + key * 4);
+	int low		  = key == 0 ? 0 :
+				       *reinterpret_cast<uint32_t *>(fan_out +
+							     (key - 1) * 4);
+	while (low < high) {
+		int mid = low + (high - low) / 2;
+		int cmp = hash_cmp(&oid, &objects[mid].idx.oid);
+		if (!cmp)
+			return &objects[mid];
+		if (cmp < 0) {
+			high = mid - 1;
+		} else {
+			low = mid + 1;
+		}
+	}
+
+	return nullptr;
 }
 
 unsigned char hex_of(unsigned char c) {
@@ -953,22 +997,16 @@ void make_tree(std::string_view url, std::string_view commit_hash) {
 	parse_pack_header();
 	auto base     = parse_pack_objects();
 	auto *objects = base.get();
-	qsort(objects, nr_objects, sizeof(*objects), hash_cmp);
 
 	struct object_id root;
 	make_hash(commit_hash.data(), reinterpret_cast<char *>(root.hash));
-	struct object_entry *o = nullptr, *tree = nullptr;
-	while ((o = find_object(objects, root))) {
-		assert(o->type == OBJ_COMMIT);
-		tree = find_object(objects, o->obj_tree);
-		if (tree && tree->type == OBJ_TREE) {
-			break;
-		}
-		memcpy(root.hash, o->obj_parent.hash, GIT_SHA1_RAWSZ);
-	}
+	struct object_entry *o = find_object(objects, root);
 	if (!o) {
 		die("Invalid commit hash provided %s\n", commit_hash.data());
 	}
+	assert(o->type == OBJ_COMMIT);
+	struct object_entry *tree = find_object(objects, o->obj_tree);
+	assert(tree && tree->type == OBJ_TREE);
 
 	printf("\nroot hash: ");
 	for (int i = 0; i < GIT_SHA1_RAWSZ; ++i) {
@@ -1079,7 +1117,7 @@ void *fetch_package(void *param) {
 
 	curl_easy_perform(curl);
 
-	char buf[4096];
+	char buf[BUFFER_SIZE];
 	size_t count = 0;
 
 	printf("Done!\n");
@@ -1088,7 +1126,7 @@ void *fetch_package(void *param) {
 		write_in_full(comm_fd, buf, count);
 	}
 
-	unlink(tmp_file);
+	fs::remove(tmp_file);
 	curl_slist_free_all(list);
 	curl_easy_cleanup(curl);
 
