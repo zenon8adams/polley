@@ -9,9 +9,9 @@
 #
 # These settings are mirrored in .editorconfig.  Keep them in sync.
 UseTab: Always
-TabWidth: 8
-IndentWidth: 8
-ContinuationIndentWidth: 8
+TabWidth: 4
+IndentWidth: 4
+ContinuationIndentWidth: 4
 ColumnLimit: 80
 
 # C Language specifics
@@ -21,6 +21,10 @@ Language: Cpp
 # someLongFunction(argument1,
 #                  argument2);
 AlignAfterOpenBracket: Align
+
+#AlignConsecutiveMacros: AcrossEmptyLinesAndComments
+#AlignEscapedNewlines: Right
+AlignEscapedNewlinesLeft: false
 
 # Don't align consecutive assignments
 # int aaaa = 12;
@@ -69,8 +73,9 @@ AlwaysBreakAfterReturnType: None
 # Pack as many parameters or arguments onto the same line as possible
 # int myFunction(int aaaaaaaaaaaa, int bbbbbbbb,
 #                int cccc);
-BinPackArguments: true
-BinPackParameters: true
+BinPackArguments: false
+BinPackParameters: false
+AlignAfterOpenBracket: Align
 
 # Attach braces to surrounding context except break before braces on function
 # definitions.
@@ -177,7 +182,7 @@ ForEachMacros:
 MaxEmptyLinesToKeep: 1
 
 # No empty line at the start of a block.
-KeepEmptyLinesAtTheStartOfBlocks: false
+KeepEmptyLinesAtTheStartOfBlocks: true
 
 # Penalties
 # This decides what order things should be done if a line is too long
