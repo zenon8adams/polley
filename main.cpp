@@ -98,7 +98,6 @@ enum file_type {
 
 struct object_id {
 	unsigned char hash[GIT_MAX_RAWSZ];
-	int algo; /* XXX requires 4-byte alignment */
 };
 
 struct pack_idx_entry {
@@ -159,7 +158,9 @@ struct vtask {
 	size_t size, cursor;
 	struct vtask *next;
 	static size_t total;
-} *task_head = nullptr;
+} *task_head = nullptr,
+  /* An indicator to denote end of unexpected termination. */
+	**task_fail = nullptr;
 
 size_t vtask::total = 0;
 
@@ -170,6 +171,16 @@ struct vtask_tail {
 	struct vtask *prev = nullptr;
 } vtail;
 
+struct api_cb_data {
+	CURL *curl = nullptr;
+	long code{};
+	void *user_data = nullptr;
+	/*
+	 * Holds reference to received message
+	 */
+	char *recv = nullptr;
+};
+
 unsigned long big_file_threshold = 512 * 1024 * 1024;
 static unsigned char input_buffer[BUFFER_SIZE];
 static unsigned int input_offset, input_len;
@@ -177,8 +188,13 @@ static off_t consumed_bytes;
 static off_t max_input_size;
 static uint32_t input_crc32;
 static int input_fd, output_fd;
-static int nr_objects;
-static int nr_deltas;
+static int n_objects;
+static int n_deltas;
+/* Keep track of hash of all data we received from
+ * the server so that we can confirm that we received
+ * uncorrupted data.
+ */
+SHA_CTX input_ctx;
 
 using ustring_view = std::basic_string_view<unsigned char>;
 template <> struct std::hash<ustring_view> {
@@ -238,12 +254,14 @@ static void die_routine(const char *err, va_list params);
 void die_errno(const char *fmt, ...);
 static const char *fmt_with_err(char *buf, int n, const char *fmt);
 static void bad_object(off_t offset, const char *format, ...);
-void write_or_die(int fd, const void *buf, size_t count);
 
 int hash_cmp(const void *one, const void *other);
 unsigned char hex_of(unsigned char c);
 
 void print_hash(const unsigned char *hash, bool nl = true);
+
+CURLcode get_response(CURL *curl, long *status = nullptr);
+void api_die_on_error(const struct api_cb_data *api);
 
 void sha_init(SHA_CTX *ctx) {
 	DISABLE_DEPRECATED_WARNINGS_BEGIN;
@@ -268,7 +286,7 @@ int format_object_header(char *str,
 						 enum object_type type,
 						 size_t objsize);
 
-void wait_on_child(pid_t pid);
+int wait_on_child(pid_t pid, bool poll = false);
 
 const char *object_type_to_str(enum object_type type) {
 	switch (type) {
@@ -370,22 +388,9 @@ static int handle_nonblock(int fd, short poll_events, int err) {
 
 static void flush() {
 	if (input_offset) {
+		sha_update(&input_ctx, input_buffer, input_offset);
 		memmove(input_buffer, input_buffer + input_offset, input_len);
 		input_offset = 0;
-	}
-}
-
-void write_or_die(int fd, const void *buf, size_t count) {
-	if (write_in_full(fd, buf, count) < 0) {
-		check_pipe(errno);
-		die_errno("write error");
-	}
-}
-
-void check_pipe(int err) {
-	if (err == EPIPE) {
-		/* Should never happen, but just in case... */
-		exit(141);
 	}
 }
 
@@ -436,8 +441,8 @@ static void parse_pack_header() {
 	if (!pack_version_ok(hdr->hdr_version))
 		die("pack version %" PRIu32 " unsupported", ntohl(hdr->hdr_version));
 
-	nr_objects = static_cast<int>(ntohl(hdr->hdr_entries));
-	printf("Number of objects: %d\n", nr_objects);
+	n_objects = static_cast<int>(ntohl(hdr->hdr_entries));
+	printf("Number of objects: %d\n", n_objects);
 
 	use(sizeof(struct pack_header));
 }
@@ -468,8 +473,11 @@ void write_subtree(struct object_entry *obj_tree) {
 
 static std::unique_ptr<struct object_entry[]>
 parse_pack_objects(struct ref_delta **refs, hash_map &obj_map) {
-	auto objects = std::make_unique<struct object_entry[]>(nr_objects);
-	for (int i = 0; i < nr_objects; i++) {
+	unsigned char computed_hash[GIT_SHA1_RAWSZ];
+	auto objects = std::make_unique<struct object_entry[]>(n_objects);
+
+	sha_init(&input_ctx);
+	for (int i = 0; i < n_objects; i++) {
 		auto obj	   = &objects[i];
 		auto data	   = unpack_raw_entry(obj);
 		obj->real_type = obj->type;
@@ -481,7 +489,7 @@ parse_pack_objects(struct ref_delta **refs, hash_map &obj_map) {
 		print_hash(is_delta_type(obj->real_type) ? obj->base_object.hash :
 												   obj->idx.oid.hash);
 		if (obj->type == OBJ_REF_DELTA) {
-			++nr_deltas;
+			++n_deltas;
 		} else if (obj->type == OBJ_TREE) {
 			write_subtree(obj);
 		} else if (obj->type == OBJ_COMMIT) {
@@ -489,13 +497,23 @@ parse_pack_objects(struct ref_delta **refs, hash_map &obj_map) {
 		}
 	}
 
-	auto objs = objects.get();
-	if (nr_deltas > 0) {
-		*refs = new ref_delta[nr_deltas];
-	}
-	printf("Number of refs: %d\n", nr_deltas);
+	flush();
 
-	for (int i = 0, j = 0; i < nr_objects; ++i) {
+	sha_final(computed_hash, &input_ctx);
+	if (hash_cmp(fill(GIT_SHA1_RAWSZ), computed_hash)) {
+		close(input_fd);
+		die("pack is corrupted (SHA1 mismatch)");
+	}
+
+	use(GIT_SHA1_RAWSZ);
+
+	auto objs = objects.get();
+	if (n_deltas > 0) {
+		*refs = new ref_delta[n_deltas];
+	}
+	printf("Number of refs: %d\n", n_deltas);
+
+	for (int i = 0, j = 0; i < n_objects; ++i) {
 		if (is_delta_type(objs[i].type)) {
 			(*refs)[j++] = { .base = &objs[i], .is_resolved = false };
 		} else {
@@ -539,7 +557,8 @@ unpack_raw_entry(struct object_entry *obj) {
 			break;
 		case OBJ_OFS_DELTA:
 			assert(0);
-			die("Encountered unsupported delta (OBJ_OFS_DELTA) type");
+			die("Encountered unsupported delta (%s) type",
+				object_type_to_str(obj->type));
 			break;
 		case OBJ_COMMIT:
 		case OBJ_TREE:
@@ -701,6 +720,8 @@ std::unique_ptr<unsigned char> patch_delta(const void *src_buf,
 void resolve_delta(struct object_entry *delta_obj, struct object_entry *base) {
 	std::unique_ptr<unsigned char> result_data;
 	unsigned long result_size;
+	SHA_CTX ctx;
+	char hdr[GIT_MAX_RAWSZ];
 
 	result_data = patch_delta(base->content,
 							  base->size,
@@ -715,10 +736,8 @@ void resolve_delta(struct object_entry *delta_obj, struct object_entry *base) {
 	delta_obj->content	 = result_data.release();
 	delta_obj->size		 = result_size;
 	delta_obj->real_type = base->real_type;
-	SHA_CTX ctx;
-	char hdr[GIT_MAX_RAWSZ];
-	int hdrlen = format_object_header(
-		hdr, sizeof(hdr), delta_obj->real_type, delta_obj->size);
+	int hdrlen			 = format_object_header(
+		  hdr, sizeof(hdr), delta_obj->real_type, delta_obj->size);
 	sha_init(&ctx);
 	sha_update(&ctx, hdr, hdrlen);
 	sha_update(&ctx, delta_obj->content, delta_obj->size);
@@ -732,9 +751,9 @@ void resolve_delta(struct object_entry *delta_obj, struct object_entry *base) {
 }
 
 void fixup_delta(struct ref_delta *refs, hash_map &obj_map) {
-	for (int nr_resolved = 0; nr_resolved < nr_deltas;) {
+	for (int n_resolved = 0; n_resolved < n_deltas;) {
 		ustring_view hash;
-		for (int i = 0; i < nr_deltas; ++i) {
+		for (int i = 0; i < n_deltas; ++i) {
 			if (refs[i].is_resolved) {
 				continue;
 			}
@@ -751,7 +770,7 @@ void fixup_delta(struct ref_delta *refs, hash_map &obj_map) {
 			hash			  = ustring_view(ref->idx.oid.hash, GIT_SHA1_RAWSZ);
 			obj_map[hash]	  = ref;
 			refs->is_resolved = true;
-			++nr_resolved;
+			++n_resolved;
 		}
 	}
 
@@ -777,7 +796,7 @@ void subobject_update(struct object_entry *obj,
 }
 
 void subobject_finalize(struct object_entry *obj) {
-	if (obj->type == OBJ_TREE) {
+	if (obj->real_type == OBJ_TREE) {
 		for (auto p = obj->mini; p;) {
 			auto next = p->next;
 			free(p->filename);
@@ -893,7 +912,7 @@ int git_inflate(git_zstream *strm, int flush) {
 static const char *zerr_to_string(int status) {
 	switch (status) {
 		case Z_MEM_ERROR:
-			return "o; of memory";
+			return "out of memory";
 		case Z_VERSION_ERROR:
 			return "wrong version";
 		case Z_NEED_DICT:
@@ -1075,9 +1094,15 @@ size_t total_size(const struct vtask *head) {
 size_t read_from_head(void *buf, size_t len) {
 
 	std::unique_lock lock(task_lock);
-	task_watcher.wait(lock, [=] {
-		return task_head != nullptr && vtask::total >= len;
+	task_watcher.wait(lock, [&] {
+		return task_fail != nullptr ||
+			   (task_head != nullptr && vtask::total >= len);
 	});
+
+	// The fetching thread exited unexpectedly.
+	if (task_fail) {
+		die("Unable to complete request\n");
+	}
 
 	assert(total_size(task_head) == vtask::total);
 
@@ -1239,12 +1264,14 @@ void make_tree(std::string_view url, std::string_view commit_hash) {
 	fs::create_directory(dirname);
 	create_structure(obj_map, tree, dirname);
 
-	for (int i = 0; i < nr_objects; ++i) {
+	for (int i = 0; i < n_objects; ++i) {
 		auto obj = objects[i];
 		subobject_finalize(&obj);
-		if (obj.real_type == OBJ_BLOB) {
-			delete[] obj.content;
-		}
+		delete[] obj.content;
+	}
+
+	if (refs) {
+		delete[] refs;
 	}
 }
 
@@ -1265,6 +1292,12 @@ struct curl_slist *add_generic_headers(struct curl_slist *list) {
 							 "Git-Protocol: "
 							 "version=2");
 	return list;
+}
+
+void set_abort_condition(CURL *curl) {
+	/* abort if slower than 30 bytes/sec during 60 seconds */
+	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 30L);
+	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 60L);
 }
 
 std::string add_query_params(std::string_view url,
@@ -1367,13 +1400,19 @@ check_pktline(struct check_pktline_state *state, const char *ptr, size_t size) {
 }
 
 size_t
-forward_response_cb(void *content, size_t size, size_t nmemb, void *buffer) {
-	static int count = 0;
-	if (++count == 1) {
-		fwrite(content, size, nmemb, stdout);
+forward_response_cb(void *content, size_t size, size_t nmemb, void *raw) {
+	auto *api	= static_cast<struct api_cb_data *>(raw);
+	auto *state = static_cast<struct check_pktline_state *>(api->user_data);
+
+	if (get_response(api->curl, &api->code) != CURLE_OK) {
+		return size * nmemb;
 	}
-	printf("Received: %zu bytes\n", size * nmemb);
-	auto *state = static_cast<struct check_pktline_state *>(buffer);
+
+	if (api->code >= 300) {
+		api->recv = static_cast<char *>(content);
+		return size * nmemb;
+	}
+
 	check_pktline(state, static_cast<const char *>(content), size * nmemb);
 	{
 		std::lock_guard _(task_lock);
@@ -1401,6 +1440,7 @@ void *fetch_package(void *param) {
 
 	CURL *curl				= curl_easy_init();
 	struct curl_slist *list = nullptr;
+	api_cb_data api			= { .curl = curl, .user_data = &check_pack };
 
 	auto url	 = add_query_params(original_url, "git-upload-pack");
 	auto request = "0011command=fetch"
@@ -1414,24 +1454,25 @@ void *fetch_package(void *param) {
 				   "0010no-progress\n"
 				   "0009done\n0000";
 
-	std::cout << "Request: " << std::quoted(request) << std::endl;
-
 	printf("Url: %s\n", url.data());
 
 	curl_easy_setopt(curl, CURLOPT_URL, url.data());
 	curl_easy_setopt(curl, CURLOPT_POST, 1L);
 	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, request.data());
+	set_abort_condition(curl);
 
 	list = add_generic_headers(list);
 	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, list);
 
-	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &check_pack);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &api);
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, forward_response_cb);
 
-	curl_easy_perform(curl);
+	api.code = curl_easy_perform(curl);
 
 	curl_slist_free_all(list);
 	curl_easy_cleanup(curl);
+
+	api_die_on_error(&api);
 
 	return nullptr;
 }
@@ -1485,6 +1526,7 @@ void run_task(std::string_view u, std::string_view commit_hash) {
 		close(output_fd);
 		make_tree(u, commit_hash);
 		close(input_fd);
+		exit(EXIT_SUCCESS);
 	} else {
 		close(child_comm_fds[0]);
 		// Setup pipe to communicate with curl callback
@@ -1518,19 +1560,38 @@ void run_task(std::string_view u, std::string_view commit_hash) {
 			} else if (seen_pack) {
 				write_in_full(output_fd, &str[0], str.length());
 			}
+
+			if (wait_on_child(-1, false) == cpid) {
+				pthread_kill(curl_comm_id, SIGKILL);
+				die("An error occurred while processing!\n");
+			}
 		}
 
 		pthread_join(curl_comm_id, nullptr);
 		wait_on_child(cpid);
 		close(output_fd);
 		close(input_fd);
+
+		exit(EXIT_SUCCESS);
 	}
 }
 
 size_t
-query_commit_hash_cb(void *contents, size_t size, size_t nmemb, void *hash) {
+query_commit_hash_cb(void *content, size_t size, size_t nmemb, void *raw) {
 	std::stringstream stream;
-	stream.write(static_cast<char *>(contents), size * nmemb);
+	stream.write(static_cast<char *>(content), size * nmemb);
+
+	auto *api  = static_cast<api_cb_data *>(raw);
+	auto *hash = static_cast<char *>(api->user_data);
+
+	if (get_response(api->curl, &api->code) != CURLE_OK) {
+		return size * nmemb;
+	}
+
+	if (api->code >= 300) {
+		api->recv = static_cast<char *>(content);
+		return size * nmemb;
+	}
 
 	std::string commit_hash;
 	bool eof = false;
@@ -1546,8 +1607,8 @@ query_commit_hash_cb(void *contents, size_t size, size_t nmemb, void *hash) {
 		die("Unable to fetch commit hash");
 	}
 
-	memcpy(static_cast<char *>(hash), commit_hash.data(), GIT_SHA1_HEXSZ);
-	static_cast<char *>(hash)[GIT_SHA1_HEXSZ] = 0;
+	memcpy(hash, commit_hash.data(), GIT_SHA1_HEXSZ);
+	hash[GIT_SHA1_HEXSZ] = 0;
 
 	return size * nmemb;
 }
@@ -1557,6 +1618,7 @@ std::string query_commit_hash(std::string_view u) {
 
 	char hash[GIT_SHA1_HEXSZ + 1];
 	if (curl) {
+		struct api_cb_data api	= { .curl = curl, .user_data = hash };
 		struct curl_slist *list = nullptr;
 		auto url				= add_query_params(u, "git-upload-pack");
 		auto request			= "0014command=ls-refs\n"
@@ -1573,17 +1635,20 @@ std::string query_commit_hash(std::string_view u) {
 
 		curl_easy_setopt(curl, CURLOPT_URL, url.data());
 		curl_easy_setopt(curl, CURLOPT_POST, 1L);
-		curl_easy_setopt(curl, CURLOPT_WRITEDATA, hash);
 		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, request);
+		set_abort_condition(curl);
 
 		list = add_generic_headers(list);
 		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, list);
 
 		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, query_commit_hash_cb);
+		curl_easy_setopt(curl, CURLOPT_WRITEDATA, &api);
 
-		curl_easy_perform(curl);
+		api.code = curl_easy_perform(curl);
 
 		curl_slist_free_all(list);
+
+		api_die_on_error(&api);
 	}
 
 	curl_easy_cleanup(curl);
@@ -1593,9 +1658,36 @@ std::string query_commit_hash(std::string_view u) {
 	return hash;
 }
 
-size_t server_support_cb(void *contents, size_t size, size_t nmemb) {
+void api_die_on_error(const struct api_cb_data *api) {
+	if (api->code != CURLE_OK || api->recv) {
+		{
+			std::lock_guard _(task_lock);
+			task_fail = &task_head;
+		}
+		task_watcher.notify_all();
+		if (api->code != CURLE_OK) {
+			die("ERROR: %s\n",
+				curl_easy_strerror(static_cast<CURLcode>(api->code)));
+		} else {
+			die("ERROR: %s\n", api->recv);
+		}
+	}
+}
+
+size_t server_support_cb(void *contents, size_t size, size_t nmemb, void *raw) {
+	auto *api = static_cast<api_cb_data *>(raw);
+
+	if (get_response(api->curl, &api->code) != CURLE_OK) {
+		return size * nmemb;
+	}
+	if (api->code >= 300) {
+		api->recv = static_cast<char *>(contents);
+		return size * nmemb;
+	}
+
 	std::stringstream stream;
-	stream.write(static_cast<char *>(contents), size * nmemb);
+	stream.write(static_cast<char *>(contents),
+				 static_cast<std::streamsize>(size * nmemb));
 	bool eof = false;
 	do {
 		auto line	= strm_pkt_line(stream, &eof, true);
@@ -1625,23 +1717,34 @@ void query_server_support(const char *u) {
 	if (curl) {
 		struct curl_slist *list = nullptr;
 		auto url = add_query_params(u, "info/refs?service=git-upload-pack");
+		struct api_cb_data api = { .curl = curl };
 
 		printf("Url: %s\n", url.data());
 
 		curl_easy_setopt(curl, CURLOPT_URL, url.data());
-		curl_easy_setopt(curl, CURLOPT_WRITEDATA, u);
+		set_abort_condition(curl);
 
 		list = add_generic_headers(list);
 		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, list);
 
 		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, server_support_cb);
+		curl_easy_setopt(curl, CURLOPT_WRITEDATA, &api);
 
-		curl_easy_perform(curl);
-
+		api.code = curl_easy_perform(curl);
 		curl_slist_free_all(list);
+
+		api_die_on_error(&api);
 	}
 
 	curl_easy_cleanup(curl);
+}
+
+CURLcode get_response(CURL *curl, long *status) {
+	long status_code;
+	long *status_p = status ? status : &status_code;
+	auto code	   = curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, status_p);
+
+	return code;
 }
 
 int main(int argc, char **argv) {
@@ -1657,24 +1760,31 @@ int main(int argc, char **argv) {
 	std::string head = query_commit_hash(url);
 	run_task(url, head);
 	curl_global_cleanup();
+
+	exit(EXIT_SUCCESS);
 }
 
-void wait_on_child(pid_t pid) {
+int wait_on_child(pid_t pid, bool poll) {
 	int wstatus;
+	int id;
 	do {
-		pid_t w = waitpid(pid, &wstatus, WUNTRACED | WCONTINUED);
-		if (w == -1) {
+		id = waitpid(pid, &wstatus, (!poll ? WNOHANG : 0) | WUNTRACED);
+		if (id == -1) {
 			die_errno("waitpid");
 		}
 
-		if (WIFEXITED(wstatus)) {
-			printf("exited, status=%d\n", WEXITSTATUS(wstatus));
-		} else if (WIFSIGNALED(wstatus)) {
-			printf("killed by signal %d\n", WTERMSIG(wstatus));
-		} else if (WIFSTOPPED(wstatus)) {
-			printf("stopped by signal %d\n", WSTOPSIG(wstatus));
-		} else if (WIFCONTINUED(wstatus)) {
-			printf("continued\n");
+		if (id > 0) {
+			if (WIFEXITED(wstatus)) {
+				printf("exited, status=%d\n", WEXITSTATUS(wstatus));
+			} else if (WIFSIGNALED(wstatus)) {
+				printf("killed by signal %d\n", WTERMSIG(wstatus));
+			} else if (WIFSTOPPED(wstatus)) {
+				printf("stopped by signal %d\n", WSTOPSIG(wstatus));
+			} else if (WIFCONTINUED(wstatus)) {
+				printf("continued\n");
+			}
 		}
-	} while (!WIFEXITED(wstatus) && !WIFSIGNALED(wstatus));
+	} while (poll && !WIFEXITED(wstatus) && !WIFSIGNALED(wstatus));
+
+	return id;
 }
