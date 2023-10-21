@@ -178,7 +178,7 @@ struct api_cb_data {
 	/*
 	 * Holds reference to received message
 	 */
-	char *recv = nullptr;
+	std::string recv;
 };
 
 unsigned long big_file_threshold = 512 * 1024 * 1024;
@@ -1275,19 +1275,72 @@ void make_tree(std::string_view url, std::string_view commit_hash) {
 	}
 }
 
+static int trace_curl(CURL *handle,
+					  curl_infotype type,
+					  char *data,
+					  size_t size,
+					  void *clientp) {
+#ifdef TRACE_CURL
+	(void)handle; /* prevent compiler warning */
+	(void)clientp;
+
+	switch (type) {
+		case CURLINFO_TEXT:
+			fputs("== Info: ", stdout);
+			fwrite(data, size, 1, stdout);
+		default: /* in case a new one is introduced to shock us */
+			return 0;
+
+		case CURLINFO_HEADER_OUT:
+			printf("=> Send header ");
+			fwrite(data, size, 1, stdout);
+			break;
+		case CURLINFO_DATA_OUT:
+			printf("=> Send data ");
+			fwrite(data, size, 1, stdout);
+			putchar('\n');
+			break;
+		case CURLINFO_SSL_DATA_OUT:
+			break;
+		case CURLINFO_HEADER_IN:
+			printf("<= Recv header ");
+			fwrite(data, size, 1, stdout);
+			break;
+		case CURLINFO_DATA_IN:
+			printf("<= Recv data ");
+			fwrite(data, size, 1, stdout);
+			putchar('\n');
+			break;
+		case CURLINFO_SSL_DATA_IN:
+			break;
+	}
+#else
+	(void)handle;
+	(void)type;
+	(void)clientp;
+	(void)data;
+	(void)size;
+
+#endif
+
+	// dump(text, stderr, (unsigned char *)data, size);
+	return 0;
+}
+
 struct curl_slist *add_generic_headers(struct curl_slist *list) {
 	list = curl_slist_append(list,
 							 "Content-Type: "
-							 "application/x-gitupload-pack-request");
+							 "application/x-git-upload-pack-request");
 	list = curl_slist_append(list,
 							 "Accept: "
-							 "application/x-gitupload-pack-result");
+							 "application/x-git-upload-pack-result");
 	list = curl_slist_append(list,
 							 "Accept-Language: "
 							 "en-Us, *;q=0.9");
 	list = curl_slist_append(list,
 							 "Pragma: "
 							 "no-cache");
+	list = curl_slist_append(list, "Expect:");
 	list = curl_slist_append(list,
 							 "Git-Protocol: "
 							 "version=2");
@@ -1454,7 +1507,7 @@ void *fetch_package(void *param) {
 				   "0010no-progress\n"
 				   "0009done\n0000";
 
-	printf("Url: %s\n", url.data());
+	printf("\nUrl: %s\n", url.data());
 
 	curl_easy_setopt(curl, CURLOPT_URL, url.data());
 	curl_easy_setopt(curl, CURLOPT_POST, 1L);
@@ -1463,6 +1516,11 @@ void *fetch_package(void *param) {
 
 	list = add_generic_headers(list);
 	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, list);
+	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+	curl_easy_setopt(curl, CURLOPT_DEBUGFUNCTION, trace_curl);
+
+	/* the DEBUGFUNCTION has no effect until we enable VERBOSE */
+	// curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
 
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &api);
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, forward_response_cb);
@@ -1529,11 +1587,6 @@ void run_task(std::string_view u, std::string_view commit_hash) {
 		exit(EXIT_SUCCESS);
 	} else {
 		close(child_comm_fds[0]);
-		// Setup pipe to communicate with curl callback
-		int curl_comm_fds[2];
-		if (pipe(curl_comm_fds) == -1) {
-			die_errno("pipe");
-		}
 
 		struct fetch_args curl_comm = {
 			.hash = commit_hash.data(),
@@ -1621,25 +1674,31 @@ std::string query_commit_hash(std::string_view u) {
 		struct api_cb_data api	= { .curl = curl, .user_data = hash };
 		struct curl_slist *list = nullptr;
 		auto url				= add_query_params(u, "git-upload-pack");
-		auto request			= "0014command=ls-refs\n"
-								  "0010agent=polley"
-								  "0016object-format=sha1"
-								  "0001"
-								  "0009peel\n"
-								  "000csymrefs\n"
-								  "000bunborn\n"
-								  "0014ref-prefix HEAD\n"
-								  "0000";
+		auto request			= std::string("0014command=ls-refs\n"
+											  "0010agent=polley"
+											  "0016object-format=sha1"
+											  "0001"
+											  "0014ref-prefix HEAD\n"
+											  "0000");
 
 		printf("Url: %s\n", url.data());
 
+		curl_easy_setopt(curl, CURLOPT_NOBODY, 0);
 		curl_easy_setopt(curl, CURLOPT_URL, url.data());
 		curl_easy_setopt(curl, CURLOPT_POST, 1L);
-		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, request);
+		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, request.data());
+		curl_easy_setopt(
+			curl, CURLOPT_POSTFIELDSIZE_LARGE, curl_off_t(request.size()));
+		curl_easy_setopt(curl, CURLOPT_FAILONERROR, 0);
 		set_abort_condition(curl);
 
 		list = add_generic_headers(list);
 		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, list);
+		curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+		curl_easy_setopt(curl, CURLOPT_DEBUGFUNCTION, trace_curl);
+
+		/* the DEBUGFUNCTION has no effect until we enable VERBOSE */
+		curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
 
 		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, query_commit_hash_cb);
 		curl_easy_setopt(curl, CURLOPT_WRITEDATA, &api);
@@ -1659,7 +1718,7 @@ std::string query_commit_hash(std::string_view u) {
 }
 
 void api_die_on_error(const struct api_cb_data *api) {
-	if (api->code != CURLE_OK || api->recv) {
+	if (api->code != CURLE_OK || !api->recv.empty()) {
 		{
 			std::lock_guard _(task_lock);
 			task_fail = &task_head;
@@ -1669,7 +1728,7 @@ void api_die_on_error(const struct api_cb_data *api) {
 			die("ERROR: %s\n",
 				curl_easy_strerror(static_cast<CURLcode>(api->code)));
 		} else {
-			die("ERROR: %s\n", api->recv);
+			die("ERROR: %s\n", api->recv.data());
 		}
 	}
 }
@@ -1726,7 +1785,11 @@ void query_server_support(const char *u) {
 
 		list = add_generic_headers(list);
 		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, list);
+		curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+		curl_easy_setopt(curl, CURLOPT_DEBUGFUNCTION, trace_curl);
 
+		/* the DEBUGFUNCTION has no effect until we enable VERBOSE */
+		curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
 		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, server_support_cb);
 		curl_easy_setopt(curl, CURLOPT_WRITEDATA, &api);
 
